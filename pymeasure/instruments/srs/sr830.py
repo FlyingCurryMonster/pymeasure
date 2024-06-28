@@ -421,16 +421,21 @@ class SR830(Instrument):
         offset, expand = self.ask("OEXP? %d" % channel).split(',')
         return float(offset), self.EXPANSION_VALUES[int(expand)]
 
-    def set_scaling(self, channel, precent, expand=0):
+    def set_scaling(self, channel, percent=None, expand=None):
         """ Sets the offset of a channel (X=1, Y=2, R=3) to a
         certain percent (-105% to 105%) of the signal, with
         an optional expansion term (0, 10=1, 100=2)
         """
         if channel not in self.CHANNELS:
             raise ValueError('SR830 channel is invalid')
+        if percent is None:
+            percent = self.get_scaling(channel)[0]
+        if expand is None:
+            expand = self.get_scaling(channel)[1]
         channel = self.CHANNELS.index(channel) + 1
         expand = discreteTruncate(expand, self.EXPANSION_VALUES)
-        self.write("OEXP %i,%.2f,%i" % (channel, precent, expand))
+        expand = self.EXPANSION_VALUES.index(int(expand))
+        self.write("OEXP %i,%.2f,%i" % (channel, percent, expand))
 
     def output_conversion(self, channel):
         """ Returns a function that can be used to determine
@@ -553,6 +558,53 @@ class SR830(Instrument):
         ch2[index:count] = self.get_buffer(2, index, count)
         return (ch1.mean(), ch1.std(), ch2.mean(), ch2.std())
 
+    def buffer_measure_fast(self, buffer_size, fast=True, timeout=60,):
+        '''
+        Buffer measurement method that returns
+        both channel 1 and channel 2 buffers as np.arrays.
+        Args:
+        buffer_size:  Desired minimum buffer length.
+        If fast == True,  FAST2 is the data transfer method.
+        FAST2 sends data through the adapter ~0.5seconds
+        after `start_buffer` is called.
+        If  fast == False, FAST0 is the transfer mode and
+        an appropriate timeout needs to be spcified.
+        See programming section of the SR830 manual for more detail.
+        '''
+        self.reset_buffer()
+        if fast:
+            standard_timeout = 3E3
+            sleep_time = np.max([standard_timeout/1e3, buffer_size/self.sample_frequency + 0.5])
+            self.adapter.connection.timeout = sleep_time * 1E3
+            self.start_buffer(fast)
+            try:
+                buffer_bytes = self.read_bytes(4*buffer_size)
+                self.pause_buffer()
+                # clear the read buffer
+                # for any accidental measurements
+                self.adapter.connection.timeout = 0.5e3
+                self.read_bytes(-1)
+                self.adapter.connection.timeout = standard_timeout
+
+                ch1_off, ch1_expand = self.get_scaling('X')
+                ch2_off, ch2_expand = self.get_scaling('Y')
+                buffer_float = np.frombuffer(buffer_bytes, dtype=np.int16) * self.sensitivity / 3e4
+                ch1_buffer = buffer_float[0::2] / ch1_expand + ch1_off / 100 * self.sensitivity
+                ch2_buffer = buffer_float[1::2] / ch2_expand + ch2_off / 100 * self.sensitivity
+            except Exception as e:
+                print(f'exception ocurred {e}')
+                self.pause_buffer()
+                self.read_bytes(-1)
+                # clear the buffer in the case of an exception
+                self.adapter.connection.timeout = standard_timeout
+                ch1_buffer, ch2_buffer = np.nan, np.nan
+        else:
+            self.wait_for_buffer(buffer_size, timeout=timeout)
+            measured_buffer_count = self.buffer_count
+            ch1_buffer = self.get_buffer_bytes(channel=1, start=0, end=measured_buffer_count)
+            ch2_buffer = self.get_buffer_bytes(channel=2, start=0, end=measured_buffer_count)
+        return ch1_buffer, ch2_buffer
+
     def pause_buffer(self):
         self.write("PAUS")
 
@@ -560,7 +612,7 @@ class SR830(Instrument):
         if fast:
             self.write("FAST2;STRD")
         else:
-            self.write("FAST0")
+            self.write("FAST0;STRT")
 
     def wait_for_buffer(self, count, has_aborted=lambda: False,
                         timeout=60, timestep=0.01):
@@ -582,49 +634,16 @@ class SR830(Instrument):
         return self.binary_values("TRCB?%d,%d,%d" % (
             channel, start, end - start))
 
-    def reset_buffer(self):
-        self.write("REST")
-
-    def buffer_measure_from_bytes(self, buffer_size, timeout=60, fast=False):
-        '''
-        Buffer measurement method that returns both channel 1 and channel 2 buffers as np.arrays
-
-        Args
-        buffer_size:  Desired minimum buffer length.
-        timeout: Timeout in seconds for the waiting/buffer fill period.
-        This should be configured approriately if sampling rate is low and buffer size is high.
-        fast: Sets the transfer mode.
-        See programming section of the SR830 manual for more detail.
-        '''
-        self.reset_buffer()
-        self.start_buffer(fast)
-        self.wait_for_buffer(buffer_size, timeout=timeout)
-        x_buffer, y_buffer = self.read_buffer_bytes()
-
-        return x_buffer, y_buffer
-
-    def read_buffer_bytes(self, count=-1, start=0, end=-1):
-        '''
-        Reads the SR830 buffer as bytes.
-        According to the manual this is the
-        fastest data transfer method over GPIB.
-
-        Args:
-        count: the number of bytest to read.
-        start: starting position of the buffer to read
-        end: ending postition of the buffer.
-        '''
-        if end == -1 or end > 2**14:
+    def get_buffer_bytes(self, channel=1, start=0, end=None):
+        """ Acquires the 32 bit floating point data through bytes transfer
+        Manual suggests this is the fastest transfer method.
+        The byte to float conversion is provided in the manual
+        and implemented in `buffer_bytes_convert`
+        """
+        if end is None:
             end = self.buffer_count
-
-        self.write(f'TRCL?1, {start}, {end}')
-        x_bytes = self.read_bytes(count)
-        self.write(f'TRCL?2, {start}, {end}')
-        y_bytes = self.read_bytes(count)
-
-        x_buffer = self.buffer_bytes_convert(x_bytes)
-        y_buffer = self.buffer_bytes_convert(y_bytes)
-        return x_buffer, y_buffer
+        self.write("TRCL?%d,%d,%d" % (channel, start, end - start))
+        return self.buffer_bytes_convert(self.read_bytes(-1))
 
     def buffer_bytes_convert(self, buffer):
         '''
@@ -639,6 +658,9 @@ class SR830(Instrument):
         mantissa = remainder - divsor*2**15
         exp = np.array(list(buffer[2::4]))
         return mantissa*np.power(np.ones(shape=exp.shape)*2, exp-124)
+
+    def reset_buffer(self):
+        self.write("REST")
 
     def trigger(self):
         self.write("TRIG")
