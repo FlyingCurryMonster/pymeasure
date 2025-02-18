@@ -1,7 +1,7 @@
 #
 # This file is part of the PyMeasure package.
 #
-# Copyright (c) 2013-2024 PyMeasure Developers
+# Copyright (c) 2013-2025 PyMeasure Developers
 #
 # Permission is hereby granted, free of charge, to any person obtaining a copy
 # of this software and associated documentation files (the "Software"), to deal
@@ -65,13 +65,15 @@ class VoltageChannel(Channel):
         self.write("C{ch}:WF? ALL")
         response = self.read_bytes(count=-1, break_on_termchar=True)
         descriptor_dictionary = self.get_descriptor()
+        data_points = descriptor_dictionary["numDataPoints"] if descriptor_dictionary["numDataPoints"] else descriptor_dictionary["pointsScreen"]  # noqa: E501
         rawWaveform = list(
             struct.unpack_from(
-                "%db" % descriptor_dictionary["numDataPoints"],
+                "%db" % data_points,
                 response,
                 offset=descriptor_dictionary["descriptorOffset"],
             ),
         )
+
         waveform = [
             point * descriptor_dictionary["verticalGain"] - descriptor_dictionary["verticalOffset"]
             for point in rawWaveform
